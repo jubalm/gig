@@ -1,0 +1,39 @@
+{
+  "name": "gig",
+  "version": "0.1.0",
+  "description": "Terminal-based business management for developers",
+  "author": "Jubal Mabaquiao <https://github.com/jubalm>",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "gig": "./bin/gig.js"
+  },
+  "files": [
+    "bin/",
+    "README.md",
+    "docs/",
+    "install.sh"
+  ],
+  "scripts": {
+    "build": "npx esbuild src/index.ts --bundle --platform=node --format=esm --outfile=bin/gig.js && chmod +x bin/gig.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "cli",
+    "business",
+    "freelance",
+    "git",
+    "terminal"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jubalm/gig.git"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "@types/node": "^20.14.0",
+    "esbuild": "^0.25.9"
+  }
+}
