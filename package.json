@@ -15,7 +15,11 @@
     "install.sh"
   ],
   "scripts": {
-    "build": "npx esbuild src/index.ts --bundle --platform=node --format=esm --outfile=bin/gig.js && chmod +x bin/gig.js"
+    "build": "npx esbuild src/index.ts --bundle --platform=node --format=esm --outfile=bin/gig.js && chmod +x bin/gig.js",
+    "format": "npx @biomejs/biome format --write ./src",
+    "lint": "npx @biomejs/biome lint ./src",
+    "check": "npx @biomejs/biome check ./src",
+    "check:fix": "npx @biomejs/biome check --write ./src"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -32,8 +36,6 @@
     "url": "https://github.com/jubalm/gig.git"
   },
   "devDependencies": {
-    "typescript": "^5.5.4",
-    "@types/node": "^20.14.0",
-    "esbuild": "^0.25.9"
+    "@types/node": "^24.4.0"
   }
 }
