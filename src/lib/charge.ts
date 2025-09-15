@@ -2,7 +2,7 @@ import { execSync } from 'node:child_process'
 import { readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createInterface } from 'node:readline'
+import { createInterface, type Interface } from 'node:readline'
 import type { Config } from './config'
 import type { GitIntegration } from './git'
 import type { ChargeObject, Storage } from './storage'
@@ -28,7 +28,7 @@ export class ChargeManager {
 	 * Create a charge with the provided options
 	 */
 	async createCharge(options: CreateChargeOptions): Promise<string> {
-		const context = this.storage.getCurrentContext()
+		const context = await this.storage.getCurrentContext()
 
 		// Validate units
 		if (Number.isNaN(options.units) || options.units <= 0) {
@@ -221,7 +221,7 @@ export class ChargeManager {
 	 * Get charge history for the current context
 	 */
 	async getChargeHistory(context?: string): Promise<ChargeObject[]> {
-		const targetContext = context || this.storage.getCurrentContext()
+		const targetContext = context || (await this.storage.getCurrentContext())
 		return this.storage.getAllCharges(targetContext)
 	}
 
@@ -346,7 +346,7 @@ Tips:
 	/**
 	 * Helper to ask a question via readline
 	 */
-	private askQuestion(rl: any, question: string): Promise<string> {
+	private askQuestion(rl: Interface, question: string): Promise<string> {
 		return new Promise((resolve) => {
 			rl.question(question, (answer: string) => {
 				resolve(answer)

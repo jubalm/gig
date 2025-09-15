@@ -192,7 +192,7 @@ async function main() {
 async function handleWorkspace(
 	contextManager: WorkspaceManager,
 	workspace: string | undefined,
-	flags: Record<string, any>
+	flags: { c?: boolean }
 ) {
 	// Create new workspace
 	if (flags.c) {
@@ -223,7 +223,7 @@ async function handleWorkspace(
 	}
 }
 
-async function handleConfig(config: Config, args: string[], flags: Record<string, any>) {
+async function handleConfig(config: Config, args: string[], flags: { global?: boolean }) {
 	if (args.length === 0) {
 		console.error('Error: Config key required')
 		console.error('Usage: gig config <key> [value] [--global]')
@@ -242,7 +242,7 @@ async function handleConfig(config: Config, args: string[], flags: Record<string
 	}
 }
 
-async function handleCharge(chargeManager: ChargeManager, flags: Record<string, any>) {
+async function handleCharge(chargeManager: ChargeManager, flags: { m?: string; u?: string }) {
 	if (flags.m && flags.u) {
 		// Quick mode
 		await chargeManager.createCharge({
@@ -256,7 +256,11 @@ async function handleCharge(chargeManager: ChargeManager, flags: Record<string, 
 	}
 }
 
-async function handleCollect(collector: Collector, args: string[], flags: Record<string, any>) {
+async function handleCollect(
+	collector: Collector,
+	args: string[],
+	flags: { json?: boolean; csv?: boolean }
+) {
 	const filters = args.join(' ')
 
 	// Determine output format
@@ -271,7 +275,7 @@ async function handleCollect(collector: Collector, args: string[], flags: Record
 async function handleMark(
 	chargeManager: ChargeManager,
 	args: string[],
-	_flags: Record<string, any>
+	_flags: Record<string, never>
 ) {
 	if (args.length < 2) {
 		console.error('Error: Charge ID and state required')
@@ -296,7 +300,9 @@ async function handleMark(
 
 		if (matches.length > 1) {
 			console.error(`Error: Multiple charges match ID ${partialId}:`)
-			matches.forEach((charge) => console.error(`  ${charge.id.slice(0, 7)} - ${charge.summary}`))
+			matches.forEach((charge) => {
+				console.error(`  ${charge.id.slice(0, 7)} - ${charge.summary}`)
+			})
 			continue
 		}
 

@@ -1,642 +1,16 @@
 #!/usr/bin/env node
 
 // src/index.ts
-import { readFileSync as readFileSync4 } from "fs";
-import { join as join5, dirname as dirname3 } from "path";
-import { fileURLToPath } from "url";
-
-// src/lib/storage.ts
-import { createHash } from "crypto";
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync } from "fs";
-import { mkdir, readFile, writeFile, rename } from "fs/promises";
-import { dirname, join } from "path";
-import { createGzip, createGunzip } from "zlib";
-import { pipeline } from "stream/promises";
-import { homedir } from "os";
-var Storage = class {
-  gigDir;
-  objectsDir;
-  refsDir;
-  constructor() {
-    this.gigDir = process.env.GIG_CONFIG_PATH || join(homedir(), ".gig");
-    this.objectsDir = join(this.gigDir, "objects");
-    this.refsDir = join(this.gigDir, "refs");
-    this.ensureDirectories();
-  }
-  ensureDirectories() {
-    if (!existsSync(this.gigDir)) {
-      mkdirSync(this.gigDir, { recursive: true });
-    }
-    if (!existsSync(this.objectsDir)) {
-      mkdirSync(this.objectsDir, { recursive: true });
-    }
-    if (!existsSync(this.refsDir)) {
-      mkdirSync(this.refsDir, { recursive: true });
-    }
-  }
-  /**
-   * Generate SHA-256 hash for content addressing
-   */
-  generateHash(content) {
-    return createHash("sha256").update(content).digest("hex");
-  }
-  /**
-   * Get the file path for an object by its hash
-   */
-  getObjectPath(hash) {
-    const dir = hash.slice(0, 2);
-    const file = hash.slice(2);
-    return join(this.objectsDir, dir, file);
-  }
-  /**
-   * Store a charge object with content addressing
-   */
-  async storeCharge(charge) {
-    const content = JSON.stringify(charge, null, 2);
-    const hash = this.generateHash(content);
-    const objectPath = this.getObjectPath(hash);
-    await mkdir(dirname(objectPath), { recursive: true });
-    const tempPath = objectPath + ".tmp";
-    try {
-      const writeStream = createWriteStream(tempPath);
-      const gzip = createGzip();
-      await pipeline(
-        [content],
-        gzip,
-        writeStream
-      );
-      await rename(tempPath, objectPath);
-      return hash;
-    } catch (error) {
-      try {
-        await rename(tempPath, tempPath);
-      } catch {
-      }
-      throw error;
-    }
-  }
-  /**
-   * Retrieve a charge object by its hash
-   */
-  async getCharge(hash) {
-    const objectPath = this.getObjectPath(hash);
-    if (!existsSync(objectPath)) {
-      return null;
-    }
-    try {
-      const readStream = createReadStream(objectPath);
-      const gunzip = createGunzip();
-      const chunks = [];
-      await pipeline(
-        readStream,
-        gunzip,
-        async function* (source) {
-          for await (const chunk of source) {
-            chunks.push(chunk);
-          }
-        }
-      );
-      const content = Buffer.concat(chunks).toString("utf8");
-      const charge = JSON.parse(content);
-      return {
-        id: hash,
-        ...charge
-      };
-    } catch (error) {
-      throw new Error(`Failed to read charge ${hash}: ${error}`);
-    }
-  }
-  /**
-   * Update a reference (HEAD pointer for context)
-   */
-  async updateRef(context, hash) {
-    const refPath = join(this.refsDir, `${context.replace("/", "_")}`);
-    await mkdir(dirname(refPath), { recursive: true });
-    await writeFile(refPath, hash);
-  }
-  /**
-   * Get the HEAD reference for a context
-   */
-  async getRef(context) {
-    const refPath = join(this.refsDir, `${context.replace("/", "_")}`);
-    if (!existsSync(refPath)) {
-      return null;
-    }
-    try {
-      const content = await readFile(refPath, "utf8");
-      return content.trim();
-    } catch {
-      return null;
-    }
-  }
-  /**
-   * Get the current context
-   */
-  getCurrentContext() {
-    const currentContextPath = join(this.gigDir, "current-context");
-    if (!existsSync(currentContextPath)) {
-      return "default";
-    }
-    try {
-      return readFileSync(currentContextPath, "utf8").trim();
-    } catch {
-      return "default";
-    }
-  }
-  /**
-   * Set the current context
-   */
-  async setCurrentContext(context) {
-    const currentContextPath = join(this.gigDir, "current-context");
-    await writeFile(currentContextPath, context);
-  }
-  /**
-   * Check if a context exists
-   */
-  contextExists(context) {
-    const refPath = join(this.refsDir, `${context.replace("/", "_")}`);
-    return existsSync(refPath);
-  }
-  /**
-   * Get all contexts
-   */
-  async getAllContexts() {
-    try {
-      const { readdir } = await import("fs/promises");
-      const files = await readdir(this.refsDir);
-      return files.map((file) => file.replace("_", "/"));
-    } catch {
-      return [];
-    }
-  }
-  /**
-   * Walk the charge history from HEAD backwards
-   */
-  async *walkHistory(context) {
-    let current = await this.getRef(context);
-    while (current) {
-      const charge = await this.getCharge(current);
-      if (!charge) break;
-      yield charge;
-      current = charge.parent || null;
-    }
-  }
-  /**
-   * Get all charges for a context (helper method)
-   */
-  async getAllCharges(context) {
-    const charges = [];
-    for await (const charge of this.walkHistory(context)) {
-      charges.push(charge);
-    }
-    return charges;
-  }
-  /**
-   * Find charges across all contexts (for filtering)
-   */
-  async findCharges(filter) {
-    const allCharges = [];
-    const contexts = await this.getAllContexts();
-    const current = this.getCurrentContext();
-    if (!contexts.includes(current)) {
-      contexts.push(current);
-    }
-    for (const context of contexts) {
-      const charges = await this.getAllCharges(context);
-      allCharges.push(...charges);
-    }
-    return filter ? allCharges.filter(filter) : allCharges;
-  }
-  /**
-   * Update a charge's state in-place (simple approach for MVP)
-   */
-  async updateChargeState(chargeId, newState) {
-    const charge = await this.getCharge(chargeId);
-    if (!charge) {
-      throw new Error(`Charge ${chargeId} not found`);
-    }
-    charge.state = newState;
-    const objectPath = this.getObjectPath(chargeId);
-    const content = JSON.stringify({ ...charge, id: void 0 }, null, 2);
-    const tempPath = objectPath + ".tmp";
-    try {
-      const { createWriteStream: createWriteStream2 } = await import("fs");
-      const { createGzip: createGzip2 } = await import("zlib");
-      const { pipeline: pipeline2 } = await import("stream/promises");
-      const writeStream = createWriteStream2(tempPath);
-      const gzip = createGzip2();
-      await pipeline2(
-        [content],
-        gzip,
-        writeStream
-      );
-      await rename(tempPath, objectPath);
-    } catch (error) {
-      try {
-        await rename(tempPath, tempPath);
-      } catch {
-      }
-      throw error;
-    }
-  }
-};
-
-// src/lib/context.ts
-var WorkspaceManager = class {
-  storage;
-  constructor(storage) {
-    this.storage = storage;
-  }
-  /**
-   * Get the current workspace
-   */
-  async getCurrentWorkspace() {
-    return this.storage.getCurrentContext();
-  }
-  /**
-   * Switch to a different workspace
-   */
-  async switchWorkspace(context) {
-    if (!this.isValidContextName(context)) {
-      throw new Error(`Invalid workspace name: ${context}. Use format like 'client/project' or 'default'`);
-    }
-    if (context !== "default" && !this.storage.contextExists(context)) {
-      throw new Error(`Workspace '${context}' does not exist. Use 'gig switch -c ${context}' to create it.`);
-    }
-    await this.storage.setCurrentContext(context);
-  }
-  /**
-   * Create a new workspace and switch to it
-   */
-  async createWorkspace(context) {
-    if (!this.isValidContextName(context)) {
-      throw new Error(`Invalid workspace name: ${context}. Use format like 'client/project' or 'default'`);
-    }
-    if (this.storage.contextExists(context)) {
-      throw new Error(`Workspace '${context}' already exists`);
-    }
-    await this.storage.updateRef(context, "");
-    await this.storage.setCurrentContext(context);
-  }
-  /**
-   * List all workspaces
-   */
-  async listWorkspaces() {
-    const contexts = await this.storage.getAllContexts();
-    if (!contexts.includes("default")) {
-      contexts.unshift("default");
-    }
-    return contexts.sort();
-  }
-  /**
-   * Check if a workspace exists
-   */
-  workspaceExists(context) {
-    if (context === "default") {
-      return true;
-    }
-    return this.storage.contextExists(context);
-  }
-  /**
-   * Validate workspace name format
-   */
-  isValidContextName(context) {
-    const validPattern = /^[a-zA-Z0-9@_-]+(?:\/[a-zA-Z0-9@_-]+)*$/;
-    if (!context || context.length === 0) {
-      return false;
-    }
-    if (context.startsWith("/") || context.endsWith("/")) {
-      return false;
-    }
-    if (context.includes("//")) {
-      return false;
-    }
-    return validPattern.test(context);
-  }
-  /**
-   * Get workspace information including charge count
-   */
-  async getWorkspaceInfo(context) {
-    const targetContext = context || await this.getCurrentWorkspace();
-    const currentContext = await this.getCurrentWorkspace();
-    const charges = await this.storage.getAllCharges(targetContext);
-    const lastCharge = charges.length > 0 ? charges[0] : void 0;
-    return {
-      name: targetContext,
-      current: targetContext === currentContext,
-      chargeCount: charges.length,
-      lastCharge: lastCharge?.summary
-    };
-  }
-  /**
-   * Get all workspaces with their information
-   */
-  async getAllWorkspacesInfo() {
-    const contexts = await this.listWorkspaces();
-    const contextInfos = [];
-    for (const context of contexts) {
-      const info = await this.getWorkspaceInfo(context);
-      contextInfos.push(info);
-    }
-    return contextInfos;
-  }
-  /**
-   * Delete a workspace (removes all references but keeps charges in objects)
-   */
-  async deleteWorkspace(context) {
-    if (context === "default") {
-      throw new Error("Cannot delete the default workspace");
-    }
-    if (!this.storage.contextExists(context)) {
-      throw new Error(`Workspace '${context}' does not exist`);
-    }
-    const currentContext = await this.getCurrentWorkspace();
-    if (currentContext === context) {
-      throw new Error("Cannot delete the current workspace. Switch to another workspace first.");
-    }
-    throw new Error("Workspace deletion not yet implemented. Manually remove the ref file if needed.");
-  }
-  /**
-   * Parse workspace patterns for filtering
-   * Supports wildcards like @acme-* or client/*
-   */
-  parseWorkspacePattern(pattern) {
-    const escaped = pattern.replace(/[.+^${}()|[\\]\\]/g, "\\$&");
-    const regexPattern = escaped.replace(/\*/g, ".*").replace(/\?/g, ".");
-    return new RegExp(`^${regexPattern}$`);
-  }
-  /**
-   * Find workspaces matching a pattern
-   */
-  async findWorkspacesMatching(pattern) {
-    const allContexts = await this.listWorkspaces();
-    const regex = this.parseWorkspacePattern(pattern);
-    return allContexts.filter((context) => regex.test(context));
-  }
-};
-
-// src/lib/config.ts
-import { existsSync as existsSync2, readFileSync as readFileSync2, mkdirSync as mkdirSync2 } from "fs";
-import { writeFile as writeFile2, mkdir as mkdir2 } from "fs/promises";
-import { join as join2, dirname as dirname2 } from "path";
-import { homedir as homedir2 } from "os";
-var Config = class {
-  gigDir;
-  globalConfigPath;
-  contextManager;
-  constructor(contextManager) {
-    this.contextManager = contextManager;
-    this.gigDir = process.env.GIG_CONFIG_PATH || join2(homedir2(), ".gig");
-    this.globalConfigPath = join2(this.gigDir, "config.json");
-    this.ensureGigDirectory();
-  }
-  ensureGigDirectory() {
-    if (!existsSync2(this.gigDir)) {
-      mkdirSync2(this.gigDir, { recursive: true });
-    }
-  }
-  /**
-   * Get the config file path for a context
-   */
-  getContextConfigPath(context) {
-    const contextDir = join2(this.gigDir, "contexts", context.replace("/", "_"));
-    return join2(contextDir, "config.json");
-  }
-  /**
-   * Load configuration from a file
-   */
-  loadConfig(filePath) {
-    if (!existsSync2(filePath)) {
-      return {};
-    }
-    try {
-      const content = readFileSync2(filePath, "utf8");
-      return JSON.parse(content);
-    } catch (error) {
-      throw new Error(`Failed to parse config file ${filePath}: ${error}`);
-    }
-  }
-  /**
-   * Save configuration to a file
-   */
-  async saveConfig(filePath, config) {
-    const dir = dirname2(filePath);
-    await mkdir2(dir, { recursive: true });
-    const content = JSON.stringify(config, null, 2);
-    await writeFile2(filePath, content);
-  }
-  /**
-   * Load global configuration
-   */
-  loadGlobalConfig() {
-    return this.loadConfig(this.globalConfigPath);
-  }
-  /**
-   * Save global configuration
-   */
-  async saveGlobalConfig(config) {
-    await this.saveConfig(this.globalConfigPath, config);
-  }
-  /**
-   * Load context-specific configuration
-   */
-  loadContextConfig(context) {
-    const contextConfigPath = this.getContextConfigPath(context);
-    return this.loadConfig(contextConfigPath);
-  }
-  /**
-   * Save context-specific configuration
-   */
-  async saveContextConfig(context, config) {
-    const contextConfigPath = this.getContextConfigPath(context);
-    await this.saveConfig(contextConfigPath, config);
-  }
-  /**
-   * Set a configuration value
-   */
-  async set(key, value, global = false) {
-    const parsedValue = this.parseValue(value);
-    if (global) {
-      await this.setGlobalValue(key, parsedValue);
-    } else {
-      const currentContext = await this.contextManager.getCurrentWorkspace();
-      await this.setContextValue(currentContext, key, parsedValue);
-    }
-  }
-  /**
-   * Get a configuration value with hierarchy: context -> global -> default
-   */
-  async get(key, context) {
-    const targetContext = context || await this.contextManager.getCurrentWorkspace();
-    const contextValue = this.getContextValue(targetContext, key);
-    if (contextValue !== void 0) {
-      return contextValue;
-    }
-    const globalValue = this.getGlobalValue(key);
-    if (globalValue !== void 0) {
-      return globalValue;
-    }
-    return void 0;
-  }
-  /**
-   * Set a global configuration value
-   */
-  async setGlobalValue(key, value) {
-    const config = this.loadGlobalConfig();
-    this.setNestedValue(config, key, value);
-    await this.saveGlobalConfig(config);
-  }
-  /**
-   * Get a global configuration value
-   */
-  getGlobalValue(key) {
-    const config = this.loadGlobalConfig();
-    return this.getNestedValue(config, key);
-  }
-  /**
-   * Set a context-specific configuration value
-   */
-  async setContextValue(context, key, value) {
-    const config = this.loadContextConfig(context);
-    this.setNestedValue(config, key, value);
-    await this.saveContextConfig(context, config);
-  }
-  /**
-   * Get a context-specific configuration value
-   */
-  getContextValue(context, key) {
-    const config = this.loadContextConfig(context);
-    return this.getNestedValue(config, key);
-  }
-  /**
-   * Set a nested value in a config object using dot notation
-   */
-  setNestedValue(config, key, value) {
-    const parts = key.split(".");
-    let current = config;
-    for (let i = 0; i < parts.length - 1; i++) {
-      const part = parts[i];
-      if (!(part in current) || typeof current[part] !== "object") {
-        current[part] = {};
-      }
-      current = current[part];
-    }
-    current[parts[parts.length - 1]] = value;
-  }
-  /**
-   * Get a nested value from a config object using dot notation
-   */
-  getNestedValue(config, key) {
-    const parts = key.split(".");
-    let current = config;
-    for (const part of parts) {
-      if (current === null || current === void 0 || typeof current !== "object") {
-        return void 0;
-      }
-      current = current[part];
-    }
-    return typeof current === "string" || typeof current === "number" || typeof current === "boolean" ? current : void 0;
-  }
-  /**
-   * Parse a string value to appropriate type
-   */
-  parseValue(value) {
-    if (typeof value !== "string") {
-      return value;
-    }
-    const num = parseFloat(value);
-    if (!isNaN(num) && isFinite(num) && value.trim() === num.toString()) {
-      return num;
-    }
-    const lower = value.toLowerCase();
-    if (lower === "true") return true;
-    if (lower === "false") return false;
-    return value;
-  }
-  /**
-   * List all configuration keys and values for current context
-   */
-  async list(context) {
-    const targetContext = context || await this.contextManager.getCurrentWorkspace();
-    const result = {};
-    const globalConfig = this.loadGlobalConfig();
-    this.flattenConfig(globalConfig, result, "global");
-    const contextConfig = this.loadContextConfig(targetContext);
-    this.flattenConfig(contextConfig, result, `context.${targetContext}`);
-    return result;
-  }
-  /**
-   * Flatten a nested config object for display
-   */
-  flattenConfig(config, result, prefix) {
-    for (const [key, value] of Object.entries(config)) {
-      const fullKey = `${prefix}.${key}`;
-      if (typeof value === "object" && value !== null && !Array.isArray(value)) {
-        this.flattenConfig(value, result, fullKey);
-      } else {
-        result[fullKey] = value;
-      }
-    }
-  }
-  /**
-   * Get repositories for the current context
-   */
-  async getRepositories(context) {
-    const repos = await this.get("repositories", context);
-    if (Array.isArray(repos)) {
-      return repos;
-    }
-    if (typeof repos === "string") {
-      return repos.split(/\s+/).filter((path) => path.length > 0);
-    }
-    return [];
-  }
-  /**
-   * Set repositories for the current context
-   */
-  async setRepositories(repositories, global = false) {
-    await this.set("repositories", repositories.join(" "), global);
-  }
-  /**
-   * Add a repository to the current context
-   */
-  async addRepository(repoPath, global = false) {
-    const currentRepos = await this.getRepositories();
-    if (!currentRepos.includes(repoPath)) {
-      currentRepos.push(repoPath);
-      await this.setRepositories(currentRepos, global);
-    }
-  }
-  /**
-   * Remove a repository from the current context
-   */
-  async removeRepository(repoPath, global = false) {
-    const currentRepos = await this.getRepositories();
-    const filtered = currentRepos.filter((repo) => repo !== repoPath);
-    await this.setRepositories(filtered, global);
-  }
-  /**
-   * Get the hourly rate for the current context
-   */
-  async getRate(context) {
-    const rate = await this.get("rate", context);
-    return typeof rate === "number" ? rate : void 0;
-  }
-  /**
-   * Get the client name for the current context
-   */
-  async getClient(context) {
-    const client = await this.get("client", context);
-    return typeof client === "string" ? client : void 0;
-  }
-};
+import { readFileSync as readFileSync2 } from "node:fs";
+import { dirname as dirname3, join as join5 } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // src/lib/charge.ts
-import { execSync } from "child_process";
-import { writeFileSync as writeFileSync3, readFileSync as readFileSync3, unlinkSync } from "fs";
-import { createInterface } from "readline";
-import { tmpdir } from "os";
-import { join as join3 } from "path";
+import { execSync } from "node:child_process";
+import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createInterface } from "node:readline";
 var ChargeManager = class {
   storage;
   config;
@@ -650,8 +24,8 @@ var ChargeManager = class {
    * Create a charge with the provided options
    */
   async createCharge(options) {
-    const context = this.storage.getCurrentContext();
-    if (isNaN(options.units) || options.units <= 0) {
+    const context = await this.storage.getCurrentContext();
+    if (Number.isNaN(options.units) || options.units <= 0) {
       throw new Error("Units must be a positive number");
     }
     const gitCommits = options.git_commits || [];
@@ -684,11 +58,11 @@ var ChargeManager = class {
   async createChargeInteractive() {
     const template = await this.git.generateChargeTemplate();
     const editor = process.env.EDITOR || "vi";
-    const tempFile = join3(tmpdir(), `gig-charge-${Date.now()}.yml`);
-    writeFileSync3(tempFile, template);
+    const tempFile = join(tmpdir(), `gig-charge-${Date.now()}.yml`);
+    writeFileSync(tempFile, template);
     try {
       execSync(`${editor} "${tempFile}"`, { stdio: "inherit" });
-      const content = readFileSync3(tempFile, "utf8");
+      const content = readFileSync(tempFile, "utf8");
       const parsed = this.parseChargeTemplate(content);
       const chargeId = await this.createCharge({
         summary: parsed.summary,
@@ -710,7 +84,7 @@ var ChargeManager = class {
     const lines = content.split("\n");
     let summary = "";
     let units = 0;
-    let gitCommits = [];
+    const gitCommits = [];
     let inSummary = false;
     let inGit = false;
     for (const line of lines) {
@@ -792,7 +166,7 @@ var ChargeManager = class {
    * Get charge history for the current context
    */
   async getChargeHistory(context) {
-    const targetContext = context || this.storage.getCurrentContext();
+    const targetContext = context || await this.storage.getCurrentContext();
     return this.storage.getAllCharges(targetContext);
   }
   /**
@@ -829,17 +203,6 @@ var ChargeManager = class {
 `;
     }
     return summary;
-  }
-  /**
-   * Validate charge data
-   */
-  validateChargeData(data) {
-    if (!data.summary || data.summary.trim().length === 0) {
-      throw new Error("Summary is required");
-    }
-    if (!data.units || isNaN(data.units) || data.units <= 0) {
-      throw new Error("Units must be a positive number");
-    }
   }
   /**
    * Show charge creation help
@@ -886,7 +249,7 @@ Tips:
       }
       const unitsStr = await this.askQuestion(rl, "Units (hours, points, etc.): ");
       const units = parseFloat(unitsStr);
-      if (isNaN(units) || units <= 0) {
+      if (Number.isNaN(units) || units <= 0) {
         throw new Error("Units must be a positive number");
       }
       const includeCommits = await this.askQuestion(rl, "Include recent git commits? (y/n): ");
@@ -898,11 +261,14 @@ Tips:
           recentCommits.forEach((commit, index) => {
             console.log(`${index + 1}. ${commit.hash.slice(0, 7)} - ${commit.subject}`);
           });
-          const selection = await this.askQuestion(rl, 'Select commits (comma-separated numbers, or "all"): ');
+          const selection = await this.askQuestion(
+            rl,
+            'Select commits (comma-separated numbers, or "all"): '
+          );
           if (selection.toLowerCase() === "all") {
             gitCommits = recentCommits.map((c) => c.hash);
           } else {
-            const indices = selection.split(",").map((s) => parseInt(s.trim()) - 1);
+            const indices = selection.split(",").map((s) => parseInt(s.trim(), 10) - 1);
             gitCommits = indices.filter((i) => i >= 0 && i < recentCommits.length).map((i) => recentCommits[i].hash);
           }
         }
@@ -956,15 +322,11 @@ var Collector = class {
     }
     if (filters.since) {
       const sinceDate = this.parseTimeFilter(filters.since);
-      filteredCharges = filteredCharges.filter(
-        (charge) => new Date(charge.timestamp) >= sinceDate
-      );
+      filteredCharges = filteredCharges.filter((charge) => new Date(charge.timestamp) >= sinceDate);
     }
     if (filters.before) {
       const beforeDate = this.parseTimeFilter(filters.before);
-      filteredCharges = filteredCharges.filter(
-        (charge) => new Date(charge.timestamp) <= beforeDate
-      );
+      filteredCharges = filteredCharges.filter((charge) => new Date(charge.timestamp) <= beforeDate);
     }
     if (filters.summary) {
       const searchTerm = filters.summary.toLowerCase();
@@ -1079,28 +441,28 @@ var Collector = class {
     const units = charge.units;
     if (unitsFilter.includes("-")) {
       const [min, max] = unitsFilter.split("-").map((s) => parseFloat(s.trim()));
-      if (!isNaN(min) && !isNaN(max)) {
+      if (!Number.isNaN(min) && !Number.isNaN(max)) {
         return units >= min && units <= max;
       }
     }
     if (unitsFilter.startsWith(">=")) {
       const value = parseFloat(unitsFilter.slice(2));
-      return !isNaN(value) && units >= value;
+      return !Number.isNaN(value) && units >= value;
     }
     if (unitsFilter.startsWith("<=")) {
       const value = parseFloat(unitsFilter.slice(2));
-      return !isNaN(value) && units <= value;
+      return !Number.isNaN(value) && units <= value;
     }
     if (unitsFilter.startsWith(">")) {
       const value = parseFloat(unitsFilter.slice(1));
-      return !isNaN(value) && units > value;
+      return !Number.isNaN(value) && units > value;
     }
     if (unitsFilter.startsWith("<")) {
       const value = parseFloat(unitsFilter.slice(1));
-      return !isNaN(value) && units < value;
+      return !Number.isNaN(value) && units < value;
     }
     const exactValue = parseFloat(unitsFilter);
-    return !isNaN(exactValue) && units === exactValue;
+    return !Number.isNaN(exactValue) && units === exactValue;
   }
   /**
    * Parse time filter into Date
@@ -1109,27 +471,27 @@ var Collector = class {
   parseTimeFilter(timeFilter) {
     const now = /* @__PURE__ */ new Date();
     if (timeFilter.endsWith("d")) {
-      const days = parseInt(timeFilter.slice(0, -1));
+      const days = parseInt(timeFilter.slice(0, -1), 10);
       return new Date(now.getTime() - days * 24 * 60 * 60 * 1e3);
     }
     if (timeFilter.endsWith("w")) {
-      const weeks = parseInt(timeFilter.slice(0, -1));
+      const weeks = parseInt(timeFilter.slice(0, -1), 10);
       return new Date(now.getTime() - weeks * 7 * 24 * 60 * 60 * 1e3);
     }
     if (timeFilter.endsWith("m")) {
-      const months = parseInt(timeFilter.slice(0, -1));
+      const months = parseInt(timeFilter.slice(0, -1), 10);
       const result = new Date(now);
       result.setMonth(result.getMonth() - months);
       return result;
     }
     if (timeFilter.endsWith("y")) {
-      const years = parseInt(timeFilter.slice(0, -1));
+      const years = parseInt(timeFilter.slice(0, -1), 10);
       const result = new Date(now);
       result.setFullYear(result.getFullYear() - years);
       return result;
     }
     const parsed = new Date(timeFilter);
-    if (!isNaN(parsed.getTime())) {
+    if (!Number.isNaN(parsed.getTime())) {
       return parsed;
     }
     throw new Error(`Invalid time filter: ${timeFilter}`);
@@ -1253,60 +615,631 @@ Examples:
   }
 };
 
+// src/lib/config.ts
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join as join2 } from "node:path";
+var ConfigError = class extends Error {
+  constructor(message, cause) {
+    super(message);
+    this.cause = cause;
+    this.name = "ConfigError";
+  }
+};
+var Config = class {
+  gigDir;
+  globalConfigPath;
+  contextManager;
+  constructor(contextManager) {
+    this.contextManager = contextManager;
+    this.gigDir = process.env.GIG_CONFIG_PATH || join2(homedir(), ".gig");
+    this.globalConfigPath = join2(this.gigDir, "config.json");
+  }
+  /**
+   * Ensure gig directory exists (async version)
+   */
+  async ensureGigDirectory() {
+    try {
+      await mkdir(this.gigDir, { recursive: true });
+    } catch (error) {
+      if (error.code !== "EEXIST") {
+        throw new ConfigError(`Failed to create config directory: ${error}`);
+      }
+    }
+  }
+  /**
+   * Get the config file path for a context
+   */
+  getContextConfigPath(context) {
+    const contextDir = join2(this.gigDir, "contexts", context.replace("/", "_"));
+    return join2(contextDir, "config.json");
+  }
+  /**
+   * Load configuration from a file (async version)
+   */
+  async loadConfig(filePath) {
+    try {
+      const content = await readFile(filePath, "utf8");
+      return JSON.parse(content);
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        return {};
+      }
+      throw new ConfigError(`Failed to parse config file ${filePath}: ${error}`);
+    }
+  }
+  /**
+   * Save configuration to a file
+   */
+  async saveConfig(filePath, config) {
+    const dir = dirname(filePath);
+    await mkdir(dir, { recursive: true });
+    const content = JSON.stringify(config, null, 2);
+    await writeFile(filePath, content);
+  }
+  /**
+   * Load global configuration
+   */
+  async loadGlobalConfig() {
+    return await this.loadConfig(this.globalConfigPath);
+  }
+  /**
+   * Save global configuration
+   */
+  async saveGlobalConfig(config) {
+    await this.saveConfig(this.globalConfigPath, config);
+  }
+  /**
+   * Load context-specific configuration
+   */
+  async loadContextConfig(context) {
+    const contextConfigPath = this.getContextConfigPath(context);
+    return await this.loadConfig(contextConfigPath);
+  }
+  /**
+   * Save context-specific configuration
+   */
+  async saveContextConfig(context, config) {
+    const contextConfigPath = this.getContextConfigPath(context);
+    await this.saveConfig(contextConfigPath, config);
+  }
+  /**
+   * Set a configuration value with validation
+   */
+  async set(key, value, global = false) {
+    if (!key?.trim()) {
+      throw new ConfigError("Configuration key cannot be empty");
+    }
+    const parsedValue = this.parseValue(value);
+    await this.ensureGigDirectory();
+    if (global) {
+      await this.setGlobalValue(key, parsedValue);
+    } else {
+      const currentContext = await this.contextManager.getCurrentWorkspace();
+      await this.setContextValue(currentContext, key, parsedValue);
+    }
+  }
+  /**
+   * Get a configuration value with hierarchy: context -> global -> default
+   */
+  async get(key, context) {
+    const targetContext = context || await this.contextManager.getCurrentWorkspace();
+    const contextValue = await this.getContextValue(targetContext, key);
+    if (contextValue !== void 0) {
+      return contextValue;
+    }
+    const globalValue = await this.getGlobalValue(key);
+    if (globalValue !== void 0) {
+      return globalValue;
+    }
+    return void 0;
+  }
+  /**
+   * Set a global configuration value
+   */
+  async setGlobalValue(key, value) {
+    const config = await this.loadGlobalConfig();
+    this.setNestedValue(config, key, value);
+    await this.saveGlobalConfig(config);
+  }
+  /**
+   * Get a global configuration value
+   */
+  async getGlobalValue(key) {
+    const config = await this.loadGlobalConfig();
+    return this.getNestedValue(config, key);
+  }
+  /**
+   * Set a context-specific configuration value
+   */
+  async setContextValue(context, key, value) {
+    const config = await this.loadContextConfig(context);
+    this.setNestedValue(config, key, value);
+    await this.saveContextConfig(context, config);
+  }
+  /**
+   * Get a context-specific configuration value
+   */
+  async getContextValue(context, key) {
+    const config = await this.loadContextConfig(context);
+    return this.getNestedValue(config, key);
+  }
+  /**
+   * Set a nested value in a config object using dot notation
+   */
+  setNestedValue(config, key, value) {
+    const parts = key.split(".");
+    let current = config;
+    for (let i = 0; i < parts.length - 1; i++) {
+      const part = parts[i];
+      if (!(part in current) || typeof current[part] !== "object" || Array.isArray(current[part])) {
+        current[part] = {};
+      }
+      current = current[part];
+    }
+    current[parts[parts.length - 1]] = value;
+  }
+  /**
+   * Get a nested value from a config object using dot notation
+   */
+  getNestedValue(config, key) {
+    const parts = key.split(".");
+    let current = config;
+    for (const part of parts) {
+      if (current === null || current === void 0 || typeof current !== "object" || Array.isArray(current)) {
+        return void 0;
+      }
+      current = current[part];
+    }
+    return typeof current === "string" || typeof current === "number" || typeof current === "boolean" ? current : void 0;
+  }
+  /**
+   * Parse a value to appropriate type with better validation
+   */
+  parseValue(value) {
+    if (typeof value !== "string") {
+      return value;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return trimmed;
+    }
+    if (/^-?\d*\.?\d+$/.test(trimmed)) {
+      const num = Number(trimmed);
+      if (Number.isFinite(num)) {
+        return num;
+      }
+    }
+    const lower = trimmed.toLowerCase();
+    if (lower === "true") return true;
+    if (lower === "false") return false;
+    return trimmed;
+  }
+  /**
+   * List all configuration keys and values for current context
+   */
+  async list(context) {
+    const targetContext = context || await this.contextManager.getCurrentWorkspace();
+    const result = {};
+    const globalConfig = await this.loadGlobalConfig();
+    this.flattenConfig(globalConfig, result, "global");
+    const contextConfig = await this.loadContextConfig(targetContext);
+    this.flattenConfig(contextConfig, result, `context.${targetContext}`);
+    return result;
+  }
+  /**
+   * Flatten a nested config object for display
+   */
+  flattenConfig(config, result, prefix) {
+    for (const [key, value] of Object.entries(config)) {
+      const fullKey = `${prefix}.${key}`;
+      if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+        this.flattenConfig(value, result, fullKey);
+      } else if (Array.isArray(value)) {
+        result[fullKey] = value.join(", ");
+      } else {
+        result[fullKey] = value;
+      }
+    }
+  }
+  /**
+   * Get repositories for the current context
+   */
+  async getRepositories(context) {
+    const repos = await this.get("repositories", context);
+    if (Array.isArray(repos)) {
+      return repos;
+    }
+    if (typeof repos === "string") {
+      return repos.split(/\s+/).filter((path) => path.length > 0);
+    }
+    return [];
+  }
+  /**
+   * Set repositories for the current context
+   */
+  async setRepositories(repositories, global = false) {
+    await this.set("repositories", repositories.join(" "), global);
+  }
+  /**
+   * Add a repository to the current context
+   */
+  async addRepository(repoPath, global = false) {
+    const currentRepos = await this.getRepositories();
+    if (!currentRepos.includes(repoPath)) {
+      currentRepos.push(repoPath);
+      await this.setRepositories(currentRepos, global);
+    }
+  }
+  /**
+   * Remove a repository from the current context
+   */
+  async removeRepository(repoPath, global = false) {
+    const currentRepos = await this.getRepositories();
+    const filtered = currentRepos.filter((repo) => repo !== repoPath);
+    await this.setRepositories(filtered, global);
+  }
+  /**
+   * Get the hourly rate for the current context
+   */
+  async getRate(context) {
+    const rate = await this.get("rate", context);
+    return typeof rate === "number" ? rate : void 0;
+  }
+  /**
+   * Get the client name for the current context
+   */
+  async getClient(context) {
+    const client = await this.get("client", context);
+    return typeof client === "string" ? client : void 0;
+  }
+};
+
+// src/lib/context.ts
+var WorkspaceError = class extends Error {
+  constructor(message, operation, workspace) {
+    super(message);
+    this.operation = operation;
+    this.workspace = workspace;
+    this.name = "WorkspaceError";
+  }
+};
+var WorkspaceValidationError = class extends WorkspaceError {
+  constructor(workspace, reason) {
+    super(`Invalid workspace name '${workspace}': ${reason}`, "validation", workspace);
+    this.name = "WorkspaceValidationError";
+  }
+};
+var WorkspaceNotFoundError = class extends WorkspaceError {
+  constructor(workspace) {
+    super(`Workspace '${workspace}' does not exist`, "not-found", workspace);
+    this.name = "WorkspaceNotFoundError";
+  }
+};
+var WORKSPACE_PATTERNS = {
+  VALID_CHARS: /^[a-zA-Z0-9@_-]+(?:\/[a-zA-Z0-9@_-]+)*$/,
+  RESERVED_NAMES: /* @__PURE__ */ new Set(["default", "HEAD", "refs", "objects"]),
+  MAX_LENGTH: 200,
+  MAX_SEGMENTS: 5
+};
+var WorkspaceManager = class {
+  storage;
+  workspaceCache = /* @__PURE__ */ new Map();
+  CACHE_TTL_MS = 1e4;
+  // 10 seconds
+  constructor(storage) {
+    this.storage = storage;
+  }
+  /**
+   * Get the current workspace
+   */
+  async getCurrentWorkspace() {
+    return await this.storage.getCurrentContext();
+  }
+  /**
+   * Switch to a different workspace
+   */
+  async switchWorkspace(context) {
+    this.validateWorkspaceName(context);
+    const exists = await this.workspaceExistsWithCache(context);
+    if (!exists) {
+      throw new WorkspaceNotFoundError(context);
+    }
+    await this.storage.setCurrentContext(context);
+  }
+  /**
+   * Create a new workspace and switch to it
+   */
+  async createWorkspace(context) {
+    this.validateWorkspaceName(context);
+    const exists = await this.workspaceExistsWithCache(context);
+    if (exists) {
+      throw new WorkspaceError(`Workspace '${context}' already exists`, "create", context);
+    }
+    await this.storage.updateRef(context, "");
+    this.workspaceCache.delete(context);
+    await this.storage.setCurrentContext(context);
+  }
+  /**
+   * List all workspaces
+   */
+  async listWorkspaces() {
+    const contexts = await this.storage.getAllContexts();
+    if (!contexts.includes("default")) {
+      contexts.unshift("default");
+    }
+    return contexts.sort();
+  }
+  /**
+   * Check if a workspace exists (synchronous version for backward compatibility)
+   * Note: This method may not reflect the most current state due to async storage operations
+   */
+  workspaceExists(context) {
+    if (context === "default") {
+      return true;
+    }
+    const cached = this.workspaceCache.get(context);
+    if (cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
+      return cached.exists;
+    }
+    try {
+      return false;
+    } catch {
+      return false;
+    }
+  }
+  /**
+   * Check if a workspace exists (async version with caching)
+   */
+  async workspaceExistsAsync(context) {
+    return this.workspaceExistsWithCache(context);
+  }
+  /**
+   * Validate workspace name format with comprehensive checks
+   */
+  validateWorkspaceName(context) {
+    if (!context || context.length === 0) {
+      throw new WorkspaceValidationError(context, "workspace name cannot be empty");
+    }
+    if (context.length > WORKSPACE_PATTERNS.MAX_LENGTH) {
+      throw new WorkspaceValidationError(
+        context,
+        `workspace name too long (max ${WORKSPACE_PATTERNS.MAX_LENGTH} characters)`
+      );
+    }
+    const segments = context.split("/");
+    if (segments.length > WORKSPACE_PATTERNS.MAX_SEGMENTS) {
+      throw new WorkspaceValidationError(
+        context,
+        `too many path segments (max ${WORKSPACE_PATTERNS.MAX_SEGMENTS})`
+      );
+    }
+    if (WORKSPACE_PATTERNS.RESERVED_NAMES.has(context.toLowerCase())) {
+      throw new WorkspaceValidationError(context, "workspace name is reserved");
+    }
+    if (context.startsWith("/") || context.endsWith("/")) {
+      throw new WorkspaceValidationError(context, 'workspace name cannot start or end with "/"');
+    }
+    if (context.includes("//")) {
+      throw new WorkspaceValidationError(context, 'workspace name cannot contain consecutive "/"');
+    }
+    if (!WORKSPACE_PATTERNS.VALID_CHARS.test(context)) {
+      throw new WorkspaceValidationError(
+        context,
+        "workspace name contains invalid characters (use only a-z, A-Z, 0-9, @, _, -, /)"
+      );
+    }
+    for (const segment of segments) {
+      if (segment.length === 0) {
+        throw new WorkspaceValidationError(context, "workspace segments cannot be empty");
+      }
+      if (segment.startsWith("-") || segment.endsWith("-")) {
+        throw new WorkspaceValidationError(
+          context,
+          'workspace segments cannot start or end with "-"'
+        );
+      }
+    }
+  }
+  /**
+   * Check if workspace exists with caching
+   */
+  async workspaceExistsWithCache(context) {
+    const now = Date.now();
+    const cached = this.workspaceCache.get(context);
+    if (cached && now - cached.timestamp < this.CACHE_TTL_MS) {
+      return cached.exists;
+    }
+    const exists = context === "default" || await this.storage.contextExists(context);
+    this.workspaceCache.set(context, { exists, timestamp: now });
+    return exists;
+  }
+  /**
+   * Get workspace information including charge count
+   */
+  async getWorkspaceInfo(context) {
+    const targetContext = context || await this.getCurrentWorkspace();
+    const currentContext = await this.getCurrentWorkspace();
+    const charges = await this.storage.getAllCharges(targetContext);
+    const lastCharge = charges.length > 0 ? charges[0] : void 0;
+    return {
+      name: targetContext,
+      current: targetContext === currentContext,
+      chargeCount: charges.length,
+      lastCharge: lastCharge?.summary,
+      lastModified: lastCharge ? new Date(lastCharge.timestamp) : void 0
+    };
+  }
+  /**
+   * Get all workspaces with their information (parallel execution for performance)
+   */
+  async getAllWorkspacesInfo() {
+    const contexts = await this.listWorkspaces();
+    const infoPromises = contexts.map(
+      (context) => this.getWorkspaceInfo(context).catch((error) => {
+        console.error(`Failed to get info for workspace ${context}:`, error);
+        return {
+          name: context,
+          current: false,
+          chargeCount: 0,
+          lastCharge: void 0,
+          lastModified: void 0
+        };
+      })
+    );
+    return Promise.all(infoPromises);
+  }
+  /**
+   * Delete a workspace (removes all references but keeps charges in objects)
+   */
+  async deleteWorkspace(context) {
+    if (context === "default") {
+      throw new Error("Cannot delete the default workspace");
+    }
+    if (!this.storage.contextExists(context)) {
+      throw new Error(`Workspace '${context}' does not exist`);
+    }
+    const currentContext = await this.getCurrentWorkspace();
+    if (currentContext === context) {
+      throw new Error("Cannot delete the current workspace. Switch to another workspace first.");
+    }
+    throw new Error(
+      "Workspace deletion not yet implemented. Manually remove the ref file if needed."
+    );
+  }
+  /**
+   * Parse workspace patterns for filtering with enhanced security
+   * Supports wildcards like @acme-* or client/*
+   */
+  parseWorkspacePattern(pattern) {
+    if (pattern.length > 100) {
+      throw new WorkspaceValidationError(pattern, "pattern too long (max 100 characters)");
+    }
+    const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    const regexPattern = escaped.replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]");
+    try {
+      return new RegExp(`^${regexPattern}$`);
+    } catch (error) {
+      throw new WorkspaceValidationError(pattern, `invalid regex pattern: ${error}`);
+    }
+  }
+  /**
+   * Find workspaces matching a pattern
+   */
+  async findWorkspacesMatching(pattern) {
+    const allContexts = await this.listWorkspaces();
+    const regex = this.parseWorkspacePattern(pattern);
+    return allContexts.filter((context) => regex.test(context));
+  }
+};
+
 // src/lib/git.ts
-import { execSync as execSync2 } from "child_process";
-import { existsSync as existsSync3 } from "fs";
-import { resolve, join as join4 } from "path";
+import { exec } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join as join3, resolve } from "node:path";
+import { promisify } from "node:util";
+var execAsync = promisify(exec);
+var repoValidationCache = /* @__PURE__ */ new Map();
+var CACHE_TTL_MS = 3e4;
 var GitIntegration = class {
   config;
   constructor(config) {
     this.config = config;
   }
   /**
-   * Check if a directory is a git repository
+   * Check if a directory is a git repository with caching
    */
   isGitRepository(path) {
-    const gitDir = join4(path, ".git");
-    return existsSync3(gitDir);
+    const now = Date.now();
+    const cached = repoValidationCache.get(path);
+    if (cached && now - cached.timestamp < CACHE_TTL_MS) {
+      return cached.isValid;
+    }
+    const gitDir = join3(path, ".git");
+    const isValid = existsSync(gitDir);
+    repoValidationCache.set(path, { isValid, timestamp: now });
+    return isValid;
   }
   /**
-   * Get recent commits from a git repository
+   * Execute git command with proper error handling and timeout
    */
-  getCommitsFromRepo(repoPath, count = 10) {
+  async executeGitCommand(command, repoPath, timeout = 5e3) {
     try {
-      const resolvedPath = resolve(repoPath);
-      if (!this.isGitRepository(resolvedPath)) {
-        return [];
-      }
-      const gitCommand = `git log --oneline --format="%H|%s|%an|%ad" --date=iso -n ${count}`;
-      const output = execSync2(gitCommand, {
-        cwd: resolvedPath,
+      const { stdout, stderr } = await execAsync(command, {
+        cwd: repoPath,
         encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"]
-        // Ignore stderr to suppress git warnings
+        timeout,
+        maxBuffer: 1024 * 1024
+        // 1MB buffer limit
       });
-      const commits = [];
-      const lines = output.trim().split("\n");
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        const [hash, subject, author, date] = line.split("|");
-        if (hash && subject) {
-          commits.push({
-            hash: hash.trim(),
-            subject: subject.trim(),
-            author: author?.trim() || "Unknown",
-            date: date?.trim() || "",
-            repository: repoPath
-          });
-        }
-      }
-      return commits;
+      return {
+        stdout: stdout.trim(),
+        stderr: stderr.trim(),
+        success: true
+      };
     } catch (error) {
-      return [];
+      const err = error;
+      return {
+        stdout: err.stdout || "",
+        stderr: err.stderr || err.message,
+        success: false,
+        error: err
+      };
     }
   }
   /**
-   * Get recent commits from all configured repositories
+   * Validate and parse git commit line with type safety
+   */
+  parseCommitLine(line, repository) {
+    if (!line.trim()) return null;
+    const parts = line.split("|");
+    if (parts.length !== 4) {
+      console.warn(`Invalid git log format in ${repository}: expected 4 parts, got ${parts.length}`);
+      return null;
+    }
+    const [hash, subject, author, date] = parts;
+    if (!hash?.trim() || !subject?.trim()) {
+      console.warn(`Invalid commit data in ${repository}: missing hash or subject`);
+      return null;
+    }
+    if (!this.isValidCommitHash(hash.trim())) {
+      console.warn(`Invalid commit hash format in ${repository}: ${hash}`);
+      return null;
+    }
+    return {
+      hash: hash.trim(),
+      subject: subject.trim(),
+      author: author?.trim() || "Unknown",
+      date: date?.trim() || "",
+      repository
+    };
+  }
+  /**
+   * Get recent commits from a git repository (async with proper error handling)
+   */
+  async getCommitsFromRepo(repoPath, count = 10) {
+    const resolvedPath = resolve(repoPath);
+    if (!this.isGitRepository(resolvedPath)) {
+      return [];
+    }
+    const gitCommand = `git log --oneline --format="%H|%s|%an|%ad" --date=iso --no-merges -n ${count}`;
+    const result = await this.executeGitCommand(gitCommand, resolvedPath);
+    if (!result.success) {
+      console.error(`Failed to get commits from ${repoPath}: ${result.stderr}`);
+      return [];
+    }
+    const commits = [];
+    const lines = result.stdout.split("\n");
+    for (const line of lines) {
+      const commit = this.parseCommitLine(line, repoPath);
+      if (commit) {
+        commits.push(commit);
+      }
+    }
+    return commits;
+  }
+  /**
+   * Get recent commits from all configured repositories (parallel execution)
    */
   async getRecentCommits(count = 10) {
     const repositories = await this.config.getRepositories();
@@ -1317,12 +1250,19 @@ var GitIntegration = class {
       }
       return [];
     }
-    const allCommits = [];
-    for (const repo of repositories) {
-      const commits = this.getCommitsFromRepo(repo, count);
-      allCommits.push(...commits);
-    }
-    return allCommits.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()).slice(0, count);
+    const commitPromises = repositories.map(
+      (repo) => this.getCommitsFromRepo(repo, count).catch((error) => {
+        console.error(`Failed to get commits from ${repo}:`, error);
+        return [];
+      })
+    );
+    const allCommitsArrays = await Promise.all(commitPromises);
+    const allCommits = allCommitsArrays.flat();
+    return allCommits.sort((a, b) => {
+      const dateA = new Date(a.date).getTime();
+      const dateB = new Date(b.date).getTime();
+      return dateB - dateA;
+    }).slice(0, count);
   }
   /**
    * Get commits from a specific repository
@@ -1331,27 +1271,30 @@ var GitIntegration = class {
     return this.getCommitsFromRepo(repoPath, count);
   }
   /**
-   * Check if a commit exists in any configured repository
+   * Check if a commit exists in any configured repository (parallel search)
    */
   async commitExists(commitHash) {
+    if (!this.isValidCommitHash(commitHash)) {
+      return { exists: false };
+    }
     const repositories = await this.config.getRepositories();
     const reposToCheck = repositories.length > 0 ? repositories : [process.cwd()];
-    for (const repo of reposToCheck) {
-      try {
-        const resolvedPath = resolve(repo);
-        if (!this.isGitRepository(resolvedPath)) {
-          continue;
-        }
-        execSync2(`git show --no-patch ${commitHash}`, {
-          cwd: resolvedPath,
-          stdio: ["ignore", "ignore", "ignore"]
-        });
-        return { exists: true, repository: repo };
-      } catch {
-        continue;
+    const checkPromises = reposToCheck.map(async (repo) => {
+      const resolvedPath = resolve(repo);
+      if (!this.isGitRepository(resolvedPath)) {
+        return null;
       }
-    }
-    return { exists: false };
+      const result = await this.executeGitCommand(
+        `git cat-file -e ${commitHash}`,
+        resolvedPath,
+        2e3
+        // 2 second timeout for existence check
+      );
+      return result.success ? repo : null;
+    });
+    const results = await Promise.all(checkPromises);
+    const foundRepo = results.find((repo) => repo !== null);
+    return foundRepo ? { exists: true, repository: foundRepo } : { exists: false };
   }
   /**
    * Get commit details by hash
@@ -1361,25 +1304,16 @@ var GitIntegration = class {
     if (!exists || !repository) {
       return null;
     }
-    try {
-      const resolvedPath = resolve(repository);
-      const output = execSync2(`git show --no-patch --format="%H|%s|%an|%ad" --date=iso ${commitHash}`, {
-        cwd: resolvedPath,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"]
-      });
-      const line = output.trim();
-      const [hash, subject, author, date] = line.split("|");
-      return {
-        hash: hash.trim(),
-        subject: subject.trim(),
-        author: author?.trim() || "Unknown",
-        date: date?.trim() || "",
-        repository
-      };
-    } catch {
+    const resolvedPath = resolve(repository);
+    const result = await this.executeGitCommand(
+      `git show --no-patch --format="%H|%s|%an|%ad" --date=iso ${commitHash}`,
+      resolvedPath
+    );
+    if (!result.success) {
+      console.error(`Failed to get commit details for ${commitHash}:`, result.stderr);
       return null;
     }
+    return this.parseCommitLine(result.stdout, repository);
   }
   /**
    * Generate a template with recent commits for charge creation
@@ -1395,14 +1329,17 @@ units:
       template += `git:
 `;
       if (repositories.length > 1) {
-        const commitsByRepo = commits.reduce((acc, commit) => {
-          const repoName = this.getRepoName(commit.repository);
-          if (!acc[repoName]) {
-            acc[repoName] = [];
-          }
-          acc[repoName].push(commit);
-          return acc;
-        }, {});
+        const commitsByRepo = commits.reduce(
+          (acc, commit) => {
+            const repoName = this.getRepoName(commit.repository);
+            if (!acc[repoName]) {
+              acc[repoName] = [];
+            }
+            acc[repoName].push(commit);
+            return acc;
+          },
+          {}
+        );
         for (const [repoName, repoCommits] of Object.entries(commitsByRepo)) {
           template += `  ${repoName}:
 `;
@@ -1478,32 +1415,336 @@ units:
     return false;
   }
   /**
-   * List all configured repositories with their status
+   * List all configured repositories with their status (optimized with parallel checks)
    */
   async listRepositories() {
     const repositories = await this.config.getRepositories();
-    const result = [];
-    for (const repo of repositories) {
+    const repoPromises = repositories.map(async (repo) => {
       const resolvedPath = resolve(repo);
-      const exists = existsSync3(resolvedPath);
+      const exists = existsSync(resolvedPath);
       const isGitRepo = exists ? this.isGitRepository(resolvedPath) : false;
       let commitCount;
+      let lastCommitDate;
       if (isGitRepo) {
         try {
-          const commits = this.getCommitsFromRepo(resolvedPath, 1e3);
-          commitCount = commits.length;
-        } catch {
+          const countResult = await this.executeGitCommand(
+            "git rev-list --count HEAD",
+            resolvedPath,
+            3e3
+          );
+          if (countResult.success) {
+            commitCount = parseInt(countResult.stdout.trim(), 10) || 0;
+          }
+          const dateResult = await this.executeGitCommand(
+            'git log -1 --format="%ad" --date=iso',
+            resolvedPath,
+            2e3
+          );
+          if (dateResult.success) {
+            lastCommitDate = dateResult.stdout.trim();
+          }
+        } catch (error) {
+          console.warn(`Failed to get repository stats for ${repo}:`, error);
           commitCount = 0;
         }
       }
-      result.push({
+      return {
         path: repo,
         exists,
         isGitRepo,
-        commitCount
-      });
+        commitCount,
+        lastCommitDate
+      };
+    });
+    return Promise.all(repoPromises);
+  }
+};
+
+// src/lib/storage.ts
+import { createHash } from "node:crypto";
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdir as mkdir2, readFile as readFile2, rename, writeFile as writeFile2 } from "node:fs/promises";
+import { homedir as homedir2 } from "node:os";
+import { dirname as dirname2, join as join4 } from "node:path";
+import { pipeline } from "node:stream/promises";
+import { createGunzip, createGzip } from "node:zlib";
+var StorageError = class extends Error {
+  constructor(message, cause) {
+    super(message);
+    this.cause = cause;
+    this.name = "StorageError";
+  }
+};
+var ChargeNotFoundError = class extends StorageError {
+  constructor(chargeId) {
+    super(`Charge ${chargeId} not found`);
+    this.name = "ChargeNotFoundError";
+  }
+};
+var CHARGE_STATES = ["unmarked", "collectible", "billed", "paid"];
+var Storage = class {
+  gigDir;
+  objectsDir;
+  refsDir;
+  constructor() {
+    this.gigDir = process.env.GIG_CONFIG_PATH || join4(homedir2(), ".gig");
+    this.objectsDir = join4(this.gigDir, "objects");
+    this.refsDir = join4(this.gigDir, "refs");
+  }
+  /**
+   * Lazy initialization of directories using async I/O
+   * Called only when needed to avoid blocking constructor
+   */
+  async ensureDirectories() {
+    try {
+      await mkdir2(this.gigDir, { recursive: true });
+      await mkdir2(this.objectsDir, { recursive: true });
+      await mkdir2(this.refsDir, { recursive: true });
+    } catch (error) {
+      if (error.code !== "EEXIST") {
+        throw new StorageError(`Failed to create storage directories: ${error}`);
+      }
     }
-    return result;
+  }
+  /**
+   * Generate SHA-256 hash for content addressing
+   */
+  generateHash(content) {
+    return createHash("sha256").update(content, "utf8").digest("hex");
+  }
+  /**
+   * Validate charge input before storing
+   */
+  validateChargeInput(charge) {
+    if (!charge.summary?.trim()) {
+      throw new StorageError("Charge summary is required");
+    }
+    if (typeof charge.units !== "number" || charge.units <= 0) {
+      throw new StorageError("Charge units must be a positive number");
+    }
+    if (!CHARGE_STATES.includes(charge.state)) {
+      throw new StorageError(`Invalid charge state: ${charge.state}`);
+    }
+    if (!charge.context?.trim()) {
+      throw new StorageError("Charge context is required");
+    }
+    if (!charge.timestamp || Number.isNaN(Date.parse(charge.timestamp))) {
+      throw new StorageError("Invalid timestamp format, expected ISO 8601");
+    }
+  }
+  /**
+   * Safely unlink a file, suppressing ENOENT errors
+   */
+  async safeUnlink(filePath) {
+    try {
+      const { unlink } = await import("node:fs/promises");
+      await unlink(filePath);
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        console.warn(`Warning: Failed to cleanup temp file ${filePath}:`, error);
+      }
+    }
+  }
+  /**
+   * Get the file path for an object by its hash
+   */
+  getObjectPath(hash) {
+    const dir = hash.slice(0, 2);
+    const file = hash.slice(2);
+    return join4(this.objectsDir, dir, file);
+  }
+  /**
+   * Store a charge object with content addressing and validation
+   */
+  async storeCharge(charge) {
+    this.validateChargeInput(charge);
+    await this.ensureDirectories();
+    const content = JSON.stringify(charge, null, 2);
+    const hash = this.generateHash(content);
+    const objectPath = this.getObjectPath(hash);
+    try {
+      await readFile2(objectPath);
+      return hash;
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        throw new StorageError(`Error checking existing object: ${error}`);
+      }
+    }
+    await mkdir2(dirname2(objectPath), { recursive: true });
+    const { randomUUID } = await import("node:crypto");
+    const tempPath = `${objectPath}.tmp.${randomUUID()}`;
+    try {
+      const gzip = createGzip({ level: 6, chunkSize: 1024 });
+      const writeStream = createWriteStream(tempPath);
+      await pipeline([content], gzip, writeStream);
+      await rename(tempPath, objectPath);
+      return hash;
+    } catch (error) {
+      await this.safeUnlink(tempPath);
+      throw new StorageError(`Failed to store charge: ${error}`, error);
+    }
+  }
+  /**
+   * Retrieve a charge object by its hash with error handling
+   */
+  async getCharge(hash) {
+    const objectPath = this.getObjectPath(hash);
+    try {
+      const readStream = createReadStream(objectPath);
+      const gunzip = createGunzip();
+      const chunks = [];
+      await pipeline(readStream, gunzip, async (source) => {
+        for await (const chunk of source) {
+          chunks.push(chunk);
+        }
+      });
+      const content = Buffer.concat(chunks).toString("utf8");
+      const chargeData = JSON.parse(content);
+      this.validateChargeInput(chargeData);
+      return {
+        id: hash,
+        ...chargeData
+      };
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        return null;
+      }
+      throw new ChargeNotFoundError(hash);
+    }
+  }
+  /**
+   * Update a reference (HEAD pointer for context) with atomic write
+   */
+  async updateRef(context, hash) {
+    await this.ensureDirectories();
+    const refPath = join4(this.refsDir, `${context.replace("/", "_")}`);
+    const { randomUUID } = await import("node:crypto");
+    const tempPath = `${refPath}.tmp.${randomUUID()}`;
+    try {
+      await writeFile2(tempPath, hash, "utf8");
+      await rename(tempPath, refPath);
+    } catch (error) {
+      await this.safeUnlink(tempPath);
+      throw new StorageError(`Failed to update ref for context ${context}: ${error}`, error);
+    }
+  }
+  /**
+   * Get the HEAD reference for a context
+   */
+  async getRef(context) {
+    const refPath = join4(this.refsDir, `${context.replace("/", "_")}`);
+    try {
+      const content = await readFile2(refPath, "utf8");
+      return content.trim() || null;
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        return null;
+      }
+      throw new StorageError(`Failed to read ref for context ${context}: ${error}`, error);
+    }
+  }
+  /**
+   * Get the current context (async version to avoid blocking I/O)
+   */
+  async getCurrentContext() {
+    const currentContextPath = join4(this.gigDir, "current-context");
+    try {
+      const content = await readFile2(currentContextPath, "utf8");
+      return content.trim() || "default";
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        return "default";
+      }
+      throw new StorageError(`Failed to read current context: ${error}`);
+    }
+  }
+  /**
+   * Set the current context
+   */
+  async setCurrentContext(context) {
+    const currentContextPath = join4(this.gigDir, "current-context");
+    await writeFile2(currentContextPath, context);
+  }
+  /**
+   * Check if a context exists (async version)
+   */
+  async contextExists(context) {
+    const refPath = join4(this.refsDir, `${context.replace("/", "_")}`);
+    try {
+      await readFile2(refPath, "utf8");
+      return true;
+    } catch (error) {
+      return error.code !== "ENOENT";
+    }
+  }
+  /**
+   * Get all contexts
+   */
+  async getAllContexts() {
+    try {
+      const { readdir } = await import("node:fs/promises");
+      const files = await readdir(this.refsDir);
+      return files.map((file) => file.replace("_", "/"));
+    } catch {
+      return [];
+    }
+  }
+  /**
+   * Walk the charge history from HEAD backwards
+   */
+  async *walkHistory(context) {
+    let current = await this.getRef(context);
+    while (current) {
+      const charge = await this.getCharge(current);
+      if (!charge) break;
+      yield charge;
+      current = charge.parent || null;
+    }
+  }
+  /**
+   * Get all charges for a context (helper method)
+   */
+  async getAllCharges(context) {
+    const charges = [];
+    for await (const charge of this.walkHistory(context)) {
+      charges.push(charge);
+    }
+    return charges;
+  }
+  /**
+   * Find charges across all contexts (for filtering)
+   */
+  async findCharges(filter) {
+    const allCharges = [];
+    const contexts = await this.getAllContexts();
+    const current = await this.getCurrentContext();
+    if (!contexts.includes(current)) {
+      contexts.push(current);
+    }
+    for (const context of contexts) {
+      const charges = await this.getAllCharges(context);
+      allCharges.push(...charges);
+    }
+    return filter ? allCharges.filter(filter) : allCharges;
+  }
+  /**
+   * Update a charge's state by creating a new charge object (preserves immutability)
+   * This maintains the content-addressed storage principle correctly
+   */
+  async updateChargeState(chargeId, newState) {
+    const originalCharge = await this.getCharge(chargeId);
+    if (!originalCharge) {
+      throw new ChargeNotFoundError(chargeId);
+    }
+    const updatedCharge = {
+      ...originalCharge,
+      state: newState,
+      timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+      // Update timestamp for the state change
+      parent: chargeId
+      // Link to the previous version
+    };
+    return this.storeCharge(updatedCharge);
   }
 };
 
@@ -1588,7 +1829,7 @@ function showVersion() {
   const __dirname = dirname3(__filename);
   const packagePath = join5(__dirname, "package.json");
   try {
-    const pkg = JSON.parse(readFileSync4(packagePath, "utf8"));
+    const pkg = JSON.parse(readFileSync2(packagePath, "utf8"));
     console.log(`gig version ${pkg.version}`);
   } catch {
     console.log("gig version unknown");
@@ -1696,7 +1937,7 @@ async function handleCollect(collector, args, flags) {
   const output = await collector.getFormattedCollection(filters, format);
   console.log(output);
 }
-async function handleMark(chargeManager, args, flags) {
+async function handleMark(chargeManager, args, _flags) {
   if (args.length < 2) {
     console.error("Error: Charge ID and state required");
     console.error("Usage: gig mark <id> <state>");
@@ -1714,7 +1955,9 @@ async function handleMark(chargeManager, args, flags) {
     }
     if (matches.length > 1) {
       console.error(`Error: Multiple charges match ID ${partialId}:`);
-      matches.forEach((charge2) => console.error(`  ${charge2.id.slice(0, 7)} - ${charge2.summary}`));
+      matches.forEach((charge2) => {
+        console.error(`  ${charge2.id.slice(0, 7)} - ${charge2.summary}`);
+      });
       continue;
     }
     const charge = matches[0];

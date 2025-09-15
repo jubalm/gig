@@ -1,7 +1,20 @@
-import { execSync } from 'node:child_process'
+import { exec } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { promisify } from 'node:util'
 import type { Config } from './config'
+
+const execAsync = promisify(exec)
+
+// Type-safe git command execution result
+interface GitCommandResult {
+	stdout: string
+	stderr: string
+	success: boolean
+	error?: Error
+}
+
+type GitCommitData = Record<string, string | Record<string, string>>
 
 export interface GitCommit {
 	hash: string
@@ -11,6 +24,30 @@ export interface GitCommit {
 	repository: string
 }
 
+// Enhanced error types for better debugging
+export class GitError extends Error {
+	constructor(
+		message: string,
+		public readonly command: string,
+		public readonly repository: string,
+		public readonly stderr?: string
+	) {
+		super(message)
+		this.name = 'GitError'
+	}
+}
+
+export class GitRepositoryError extends GitError {
+	constructor(repository: string) {
+		super(`Invalid or inaccessible git repository: ${repository}`, 'repository-check', repository)
+		this.name = 'GitRepositoryError'
+	}
+}
+
+// Cache for git repository validation (reduces filesystem checks)
+const repoValidationCache = new Map<string, { isValid: boolean; timestamp: number }>()
+const CACHE_TTL_MS = 30000 // 30 seconds
+
 export class GitIntegration {
 	private config: Config
 
@@ -19,59 +56,128 @@ export class GitIntegration {
 	}
 
 	/**
-	 * Check if a directory is a git repository
+	 * Check if a directory is a git repository with caching
 	 */
 	private isGitRepository(path: string): boolean {
+		const now = Date.now()
+		const cached = repoValidationCache.get(path)
+
+		// Return cached result if still valid
+		if (cached && now - cached.timestamp < CACHE_TTL_MS) {
+			return cached.isValid
+		}
+
 		const gitDir = join(path, '.git')
-		return existsSync(gitDir)
+		const isValid = existsSync(gitDir)
+
+		// Cache the result
+		repoValidationCache.set(path, { isValid, timestamp: now })
+		return isValid
 	}
 
 	/**
-	 * Get recent commits from a git repository
+	 * Execute git command with proper error handling and timeout
 	 */
-	private getCommitsFromRepo(repoPath: string, count = 10): GitCommit[] {
+	private async executeGitCommand(
+		command: string,
+		repoPath: string,
+		timeout = 5000
+	): Promise<GitCommandResult> {
 		try {
-			const resolvedPath = resolve(repoPath)
-
-			if (!this.isGitRepository(resolvedPath)) {
-				return []
-			}
-
-			// Get recent commits using git log
-			const gitCommand = `git log --oneline --format="%H|%s|%an|%ad" --date=iso -n ${count}`
-			const output = execSync(gitCommand, {
-				cwd: resolvedPath,
+			const { stdout, stderr } = await execAsync(command, {
+				cwd: repoPath,
 				encoding: 'utf8',
-				stdio: ['ignore', 'pipe', 'ignore'], // Ignore stderr to suppress git warnings
+				timeout,
+				maxBuffer: 1024 * 1024, // 1MB buffer limit
 			})
 
-			const commits: GitCommit[] = []
-			const lines = output.trim().split('\n')
-
-			for (const line of lines) {
-				if (!line.trim()) continue
-
-				const [hash, subject, author, date] = line.split('|')
-				if (hash && subject) {
-					commits.push({
-						hash: hash.trim(),
-						subject: subject.trim(),
-						author: author?.trim() || 'Unknown',
-						date: date?.trim() || '',
-						repository: repoPath,
-					})
-				}
+			return {
+				stdout: stdout.trim(),
+				stderr: stderr.trim(),
+				success: true,
 			}
-
-			return commits
-		} catch (_error) {
-			// Silently ignore errors (repo might not exist, no commits, etc.)
-			return []
+		} catch (error) {
+			const err = error as Error & { stdout?: string; stderr?: string }
+			return {
+				stdout: err.stdout || '',
+				stderr: err.stderr || err.message,
+				success: false,
+				error: err,
+			}
 		}
 	}
 
 	/**
-	 * Get recent commits from all configured repositories
+	 * Validate and parse git commit line with type safety
+	 */
+	private parseCommitLine(line: string, repository: string): GitCommit | null {
+		if (!line.trim()) return null
+
+		const parts = line.split('|')
+		if (parts.length !== 4) {
+			console.warn(`Invalid git log format in ${repository}: expected 4 parts, got ${parts.length}`)
+			return null
+		}
+
+		const [hash, subject, author, date] = parts
+
+		// Validate required fields
+		if (!hash?.trim() || !subject?.trim()) {
+			console.warn(`Invalid commit data in ${repository}: missing hash or subject`)
+			return null
+		}
+
+		// Validate commit hash format
+		if (!this.isValidCommitHash(hash.trim())) {
+			console.warn(`Invalid commit hash format in ${repository}: ${hash}`)
+			return null
+		}
+
+		return {
+			hash: hash.trim(),
+			subject: subject.trim(),
+			author: author?.trim() || 'Unknown',
+			date: date?.trim() || '',
+			repository,
+		}
+	}
+
+	/**
+	 * Get recent commits from a git repository (async with proper error handling)
+	 */
+	private async getCommitsFromRepo(repoPath: string, count = 10): Promise<GitCommit[]> {
+		const resolvedPath = resolve(repoPath)
+
+		if (!this.isGitRepository(resolvedPath)) {
+			return []
+		}
+
+		// Optimize git command for performance
+		const gitCommand = `git log --oneline --format="%H|%s|%an|%ad" --date=iso --no-merges -n ${count}`
+
+		const result = await this.executeGitCommand(gitCommand, resolvedPath)
+
+		if (!result.success) {
+			// Log error for debugging but don't crash
+			console.error(`Failed to get commits from ${repoPath}: ${result.stderr}`)
+			return []
+		}
+
+		const commits: GitCommit[] = []
+		const lines = result.stdout.split('\n')
+
+		for (const line of lines) {
+			const commit = this.parseCommitLine(line, repoPath)
+			if (commit) {
+				commits.push(commit)
+			}
+		}
+
+		return commits
+	}
+
+	/**
+	 * Get recent commits from all configured repositories (parallel execution)
 	 */
 	async getRecentCommits(count = 10): Promise<GitCommit[]> {
 		const repositories = await this.config.getRepositories()
@@ -85,16 +191,24 @@ export class GitIntegration {
 			return []
 		}
 
-		const allCommits: GitCommit[] = []
+		// Execute git operations in parallel for better performance
+		const commitPromises = repositories.map((repo) =>
+			this.getCommitsFromRepo(repo, count).catch((error) => {
+				console.error(`Failed to get commits from ${repo}:`, error)
+				return [] // Return empty array on error to not break Promise.all
+			})
+		)
 
-		for (const repo of repositories) {
-			const commits = this.getCommitsFromRepo(repo, count)
-			allCommits.push(...commits)
-		}
+		const allCommitsArrays = await Promise.all(commitPromises)
+		const allCommits = allCommitsArrays.flat()
 
 		// Sort by date (most recent first) and limit to requested count
 		return allCommits
-			.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+			.sort((a, b) => {
+				const dateA = new Date(a.date).getTime()
+				const dateB = new Date(b.date).getTime()
+				return dateB - dateA
+			})
 			.slice(0, count)
 	}
 
@@ -106,32 +220,39 @@ export class GitIntegration {
 	}
 
 	/**
-	 * Check if a commit exists in any configured repository
+	 * Check if a commit exists in any configured repository (parallel search)
 	 */
 	async commitExists(commitHash: string): Promise<{ exists: boolean; repository?: string }> {
-		const repositories = await this.config.getRepositories()
+		// Validate commit hash format early
+		if (!this.isValidCommitHash(commitHash)) {
+			return { exists: false }
+		}
 
+		const repositories = await this.config.getRepositories()
 		// Include current directory if no repos configured
 		const reposToCheck = repositories.length > 0 ? repositories : [process.cwd()]
 
-		for (const repo of reposToCheck) {
-			try {
-				const resolvedPath = resolve(repo)
-				if (!this.isGitRepository(resolvedPath)) {
-					continue
-				}
+		// Check all repositories in parallel
+		const checkPromises = reposToCheck.map(async (repo) => {
+			const resolvedPath = resolve(repo)
+			if (!this.isGitRepository(resolvedPath)) {
+				return null
+			}
 
-				// Try to show the commit
-				execSync(`git show --no-patch ${commitHash}`, {
-					cwd: resolvedPath,
-					stdio: ['ignore', 'ignore', 'ignore'],
-				})
+			// Use git cat-file for faster existence check
+			const result = await this.executeGitCommand(
+				`git cat-file -e ${commitHash}`,
+				resolvedPath,
+				2000 // 2 second timeout for existence check
+			)
 
-				return { exists: true, repository: repo }
-			} catch {}
-		}
+			return result.success ? repo : null
+		})
 
-		return { exists: false }
+		const results = await Promise.all(checkPromises)
+		const foundRepo = results.find((repo) => repo !== null)
+
+		return foundRepo ? { exists: true, repository: foundRepo } : { exists: false }
 	}
 
 	/**
@@ -144,30 +265,18 @@ export class GitIntegration {
 			return null
 		}
 
-		try {
-			const resolvedPath = resolve(repository)
-			const output = execSync(
-				`git show --no-patch --format="%H|%s|%an|%ad" --date=iso ${commitHash}`,
-				{
-					cwd: resolvedPath,
-					encoding: 'utf8',
-					stdio: ['ignore', 'pipe', 'ignore'],
-				}
-			)
+		const resolvedPath = resolve(repository)
+		const result = await this.executeGitCommand(
+			`git show --no-patch --format="%H|%s|%an|%ad" --date=iso ${commitHash}`,
+			resolvedPath
+		)
 
-			const line = output.trim()
-			const [hash, subject, author, date] = line.split('|')
-
-			return {
-				hash: hash.trim(),
-				subject: subject.trim(),
-				author: author?.trim() || 'Unknown',
-				date: date?.trim() || '',
-				repository,
-			}
-		} catch {
+		if (!result.success) {
+			console.error(`Failed to get commit details for ${commitHash}:`, result.stderr)
 			return null
 		}
+
+		return this.parseCommitLine(result.stdout, repository)
 	}
 
 	/**
@@ -227,7 +336,7 @@ export class GitIntegration {
 	/**
 	 * Validate and extract commit hashes from charge git data
 	 */
-	async validateCommits(gitData: any): Promise<string[]> {
+	async validateCommits(gitData: GitCommitData | null | undefined): Promise<string[]> {
 		if (!gitData || typeof gitData !== 'object') {
 			return []
 		}
@@ -286,7 +395,7 @@ export class GitIntegration {
 	}
 
 	/**
-	 * List all configured repositories with their status
+	 * List all configured repositories with their status (optimized with parallel checks)
 	 */
 	async listRepositories(): Promise<
 		Array<{
@@ -294,34 +403,58 @@ export class GitIntegration {
 			exists: boolean
 			isGitRepo: boolean
 			commitCount?: number
+			lastCommitDate?: string
 		}>
 	> {
 		const repositories = await this.config.getRepositories()
-		const result = []
 
-		for (const repo of repositories) {
+		// Process repositories in parallel for better performance
+		const repoPromises = repositories.map(async (repo) => {
 			const resolvedPath = resolve(repo)
 			const exists = existsSync(resolvedPath)
 			const isGitRepo = exists ? this.isGitRepository(resolvedPath) : false
 
 			let commitCount: number | undefined
+			let lastCommitDate: string | undefined
+
 			if (isGitRepo) {
 				try {
-					const commits = this.getCommitsFromRepo(resolvedPath, 1000)
-					commitCount = commits.length
-				} catch {
+					// Use more efficient git command for count
+					const countResult = await this.executeGitCommand(
+						'git rev-list --count HEAD',
+						resolvedPath,
+						3000
+					)
+
+					if (countResult.success) {
+						commitCount = parseInt(countResult.stdout.trim(), 10) || 0
+					}
+
+					// Get last commit date
+					const dateResult = await this.executeGitCommand(
+						'git log -1 --format="%ad" --date=iso',
+						resolvedPath,
+						2000
+					)
+
+					if (dateResult.success) {
+						lastCommitDate = dateResult.stdout.trim()
+					}
+				} catch (error) {
+					console.warn(`Failed to get repository stats for ${repo}:`, error)
 					commitCount = 0
 				}
 			}
 
-			result.push({
+			return {
 				path: repo,
 				exists,
 				isGitRepo,
 				commitCount,
-			})
-		}
+				lastCommitDate,
+			}
+		})
 
-		return result
+		return Promise.all(repoPromises)
 	}
 }

@@ -1,27 +1,40 @@
-import { existsSync, mkdirSync, readFileSync } from 'node:fs'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { WorkspaceManager } from './context'
 
-interface ConfigData {
-	[key: string]: string | number | boolean | ConfigData
+// Custom error class for configuration errors
+export class ConfigError extends Error {
+	constructor(
+		message: string,
+		public cause?: unknown
+	) {
+		super(message)
+		this.name = 'ConfigError'
+	}
+}
+
+type ConfigValue = string | number | boolean
+type ConfigData = {
+	[key: string]: ConfigValue | ConfigData | ConfigValue[]
 }
 
 interface ContextConfig {
 	rate?: number
 	client?: string
-	repositories?: string[]
-	[key: string]: any
+	repositories?: readonly string[]
+	[key: string]: ConfigValue | ConfigValue[] | undefined
+}
+
+interface UserConfig {
+	name?: string
+	email?: string
 }
 
 interface GlobalConfig {
-	user?: {
-		name?: string
-		email?: string
-	}
+	user?: UserConfig
 	context?: ContextConfig
-	[key: string]: any
+	[key: string]: ConfigValue | object | undefined
 }
 
 export class Config {
@@ -33,13 +46,19 @@ export class Config {
 		this.contextManager = contextManager
 		this.gigDir = process.env.GIG_CONFIG_PATH || join(homedir(), '.gig')
 		this.globalConfigPath = join(this.gigDir, 'config.json')
-
-		this.ensureGigDirectory()
+		// Remove synchronous directory creation from constructor
 	}
 
-	private ensureGigDirectory() {
-		if (!existsSync(this.gigDir)) {
-			mkdirSync(this.gigDir, { recursive: true })
+	/**
+	 * Ensure gig directory exists (async version)
+	 */
+	private async ensureGigDirectory(): Promise<void> {
+		try {
+			await mkdir(this.gigDir, { recursive: true })
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+				throw new ConfigError(`Failed to create config directory: ${error}`)
+			}
 		}
 	}
 
@@ -52,18 +71,17 @@ export class Config {
 	}
 
 	/**
-	 * Load configuration from a file
+	 * Load configuration from a file (async version)
 	 */
-	private loadConfig(filePath: string): ConfigData {
-		if (!existsSync(filePath)) {
-			return {}
-		}
-
+	private async loadConfig(filePath: string): Promise<ConfigData> {
 		try {
-			const content = readFileSync(filePath, 'utf8')
+			const content = await readFile(filePath, 'utf8')
 			return JSON.parse(content)
 		} catch (error) {
-			throw new Error(`Failed to parse config file ${filePath}: ${error}`)
+			if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+				return {} // File doesn't exist, return empty config
+			}
+			throw new ConfigError(`Failed to parse config file ${filePath}: ${error}`)
 		}
 	}
 
@@ -81,8 +99,8 @@ export class Config {
 	/**
 	 * Load global configuration
 	 */
-	private loadGlobalConfig(): GlobalConfig {
-		return this.loadConfig(this.globalConfigPath) as GlobalConfig
+	private async loadGlobalConfig(): Promise<GlobalConfig> {
+		return (await this.loadConfig(this.globalConfigPath)) as GlobalConfig
 	}
 
 	/**
@@ -95,9 +113,9 @@ export class Config {
 	/**
 	 * Load context-specific configuration
 	 */
-	private loadContextConfig(context: string): ContextConfig {
+	private async loadContextConfig(context: string): Promise<ContextConfig> {
 		const contextConfigPath = this.getContextConfigPath(context)
-		return this.loadConfig(contextConfigPath) as ContextConfig
+		return (await this.loadConfig(contextConfigPath)) as ContextConfig
 	}
 
 	/**
@@ -109,10 +127,17 @@ export class Config {
 	}
 
 	/**
-	 * Set a configuration value
+	 * Set a configuration value with validation
 	 */
-	async set(key: string, value: string | number | boolean, global = false): Promise<void> {
+	async set(key: string, value: ConfigValue, global = false): Promise<void> {
+		if (!key?.trim()) {
+			throw new ConfigError('Configuration key cannot be empty')
+		}
+
 		const parsedValue = this.parseValue(value)
+
+		// Ensure directory exists before writing
+		await this.ensureGigDirectory()
 
 		if (global) {
 			await this.setGlobalValue(key, parsedValue)
@@ -125,30 +150,29 @@ export class Config {
 	/**
 	 * Get a configuration value with hierarchy: context -> global -> default
 	 */
-	async get(key: string, context?: string): Promise<string | number | boolean | undefined> {
+	async get(key: string, context?: string): Promise<ConfigValue | undefined> {
 		const targetContext = context || (await this.contextManager.getCurrentWorkspace())
 
 		// Try context-specific config first
-		const contextValue = this.getContextValue(targetContext, key)
+		const contextValue = await this.getContextValue(targetContext, key)
 		if (contextValue !== undefined) {
 			return contextValue
 		}
 
 		// Fall back to global config
-		const globalValue = this.getGlobalValue(key)
+		const globalValue = await this.getGlobalValue(key)
 		if (globalValue !== undefined) {
 			return globalValue
 		}
 
-		// Return undefined if not found
 		return undefined
 	}
 
 	/**
 	 * Set a global configuration value
 	 */
-	private async setGlobalValue(key: string, value: string | number | boolean): Promise<void> {
-		const config = this.loadGlobalConfig()
+	private async setGlobalValue(key: string, value: ConfigValue): Promise<void> {
+		const config = await this.loadGlobalConfig()
 		this.setNestedValue(config, key, value)
 		await this.saveGlobalConfig(config)
 	}
@@ -156,20 +180,16 @@ export class Config {
 	/**
 	 * Get a global configuration value
 	 */
-	private getGlobalValue(key: string): string | number | boolean | undefined {
-		const config = this.loadGlobalConfig()
+	private async getGlobalValue(key: string): Promise<ConfigValue | undefined> {
+		const config = await this.loadGlobalConfig()
 		return this.getNestedValue(config, key)
 	}
 
 	/**
 	 * Set a context-specific configuration value
 	 */
-	private async setContextValue(
-		context: string,
-		key: string,
-		value: string | number | boolean
-	): Promise<void> {
-		const config = this.loadContextConfig(context)
+	private async setContextValue(context: string, key: string, value: ConfigValue): Promise<void> {
+		const config = await this.loadContextConfig(context)
 		this.setNestedValue(config, key, value)
 		await this.saveContextConfig(context, config)
 	}
@@ -177,21 +197,21 @@ export class Config {
 	/**
 	 * Get a context-specific configuration value
 	 */
-	private getContextValue(context: string, key: string): string | number | boolean | undefined {
-		const config = this.loadContextConfig(context)
+	private async getContextValue(context: string, key: string): Promise<ConfigValue | undefined> {
+		const config = await this.loadContextConfig(context)
 		return this.getNestedValue(config, key)
 	}
 
 	/**
 	 * Set a nested value in a config object using dot notation
 	 */
-	private setNestedValue(config: ConfigData, key: string, value: string | number | boolean): void {
+	private setNestedValue(config: ConfigData, key: string, value: ConfigValue): void {
 		const parts = key.split('.')
 		let current = config
 
 		for (let i = 0; i < parts.length - 1; i++) {
 			const part = parts[i]
-			if (!(part in current) || typeof current[part] !== 'object') {
+			if (!(part in current) || typeof current[part] !== 'object' || Array.isArray(current[part])) {
 				current[part] = {}
 			}
 			current = current[part] as ConfigData
@@ -203,15 +223,20 @@ export class Config {
 	/**
 	 * Get a nested value from a config object using dot notation
 	 */
-	private getNestedValue(config: ConfigData, key: string): string | number | boolean | undefined {
+	private getNestedValue(config: ConfigData, key: string): ConfigValue | undefined {
 		const parts = key.split('.')
-		let current: any = config
+		let current: ConfigData | ConfigValue | ConfigValue[] = config
 
 		for (const part of parts) {
-			if (current === null || current === undefined || typeof current !== 'object') {
+			if (
+				current === null ||
+				current === undefined ||
+				typeof current !== 'object' ||
+				Array.isArray(current)
+			) {
 				return undefined
 			}
-			current = current[part]
+			current = (current as ConfigData)[part]
 		}
 
 		return typeof current === 'string' ||
@@ -222,41 +247,47 @@ export class Config {
 	}
 
 	/**
-	 * Parse a string value to appropriate type
+	 * Parse a value to appropriate type with better validation
 	 */
-	private parseValue(value: string | number | boolean): string | number | boolean {
+	private parseValue(value: ConfigValue): ConfigValue {
 		if (typeof value !== 'string') {
 			return value
 		}
 
+		const trimmed = value.trim()
+		if (!trimmed) {
+			return trimmed
+		}
+
 		// Try to parse as number
-		const num = parseFloat(value)
-		if (!Number.isNaN(num) && Number.isFinite(num) && value.trim() === num.toString()) {
-			return num
+		if (/^-?\d*\.?\d+$/.test(trimmed)) {
+			const num = Number(trimmed)
+			if (Number.isFinite(num)) {
+				return num
+			}
 		}
 
 		// Try to parse as boolean
-		const lower = value.toLowerCase()
+		const lower = trimmed.toLowerCase()
 		if (lower === 'true') return true
 		if (lower === 'false') return false
 
-		// Return as string
-		return value
+		return trimmed
 	}
 
 	/**
 	 * List all configuration keys and values for current context
 	 */
-	async list(context?: string): Promise<Record<string, string | number | boolean>> {
+	async list(context?: string): Promise<Record<string, ConfigValue>> {
 		const targetContext = context || (await this.contextManager.getCurrentWorkspace())
-		const result: Record<string, string | number | boolean> = {}
+		const result: Record<string, ConfigValue> = {}
 
 		// Get global config
-		const globalConfig = this.loadGlobalConfig()
+		const globalConfig = await this.loadGlobalConfig()
 		this.flattenConfig(globalConfig, result, 'global')
 
 		// Get context config (overrides global)
-		const contextConfig = this.loadContextConfig(targetContext)
+		const contextConfig = await this.loadContextConfig(targetContext)
 		this.flattenConfig(contextConfig, result, `context.${targetContext}`)
 
 		return result
@@ -267,7 +298,7 @@ export class Config {
 	 */
 	private flattenConfig(
 		config: ConfigData,
-		result: Record<string, string | number | boolean>,
+		result: Record<string, ConfigValue>,
 		prefix: string
 	): void {
 		for (const [key, value] of Object.entries(config)) {
@@ -275,8 +306,11 @@ export class Config {
 
 			if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
 				this.flattenConfig(value as ConfigData, result, fullKey)
+			} else if (Array.isArray(value)) {
+				// Handle arrays as comma-separated strings for display
+				result[fullKey] = value.join(', ')
 			} else {
-				result[fullKey] = value as string | number | boolean
+				result[fullKey] = value as ConfigValue
 			}
 		}
 	}
